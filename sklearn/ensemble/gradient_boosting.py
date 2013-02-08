@@ -442,6 +442,7 @@ class BaseGradientBoosting(BaseEnsemble):
         self.alpha = alpha
         self.verbose = verbose
         self.estimators_ = np.empty((0, 0), dtype=np.object)
+        self.fit_init_ = False
 
     def _fit_stage(self, i, X, X_argsorted, y, y_pred, sample_mask,
                    random_state):
@@ -475,6 +476,7 @@ class BaseGradientBoosting(BaseEnsemble):
             self.estimators_[i, k] = tree
 
         return y_pred
+
 
     def fit(self, X, y):
         """Fit the gradient boosting model.
@@ -558,31 +560,69 @@ class BaseGradientBoosting(BaseEnsemble):
         if not (0.0 < self.alpha and self.alpha < 1.0):
             raise ValueError("alpha must be in (0.0, 1.0)")
 
-        random_state = check_random_state(self.random_state)
-
         # use default min_density (0.1) only for deep trees
         self.min_density = 0.0 if self.max_depth < 6 else 0.1
-
-        # create argsorted X for fast tree induction
-        X_argsorted = np.asfortranarray(
-            np.argsort(X.T, axis=1).astype(np.int32).T)
 
         # fit initial model
         self.init_.fit(X, y)
 
         # init predictions
-        y_pred = self.init_.predict(X)
+        self.y_pred_ = self.init_.predict(X)
 
-        self.estimators_ = np.empty((self.n_estimators, self.loss_.K),
-                                    dtype=np.object)
+        self.estimators_ = None
 
-        self.train_score_ = np.zeros((self.n_estimators,), dtype=np.float64)
-        self.oob_score_ = np.zeros((self.n_estimators), dtype=np.float64)
+        self.train_score_ = None
+        self.oob_score_ = None
 
+
+        # perform boosting iterations
+        self.stages_fit_ = 0
+        self.fit_init_ = True
+        self.fit_more(self.n_estimators, X, y)
+
+        return self
+
+    def fit_more(self, n, X, y):
+        if not self.fit_init_:
+            self.fit(X, y)
+
+        X, y = check_arrays(X, y, sparse_format='dense')
+        X = np.asfortranarray(X, dtype=DTYPE)
+        y = np.ravel(y, order='C')
+
+        n_samples, n_features = X.shape
         sample_mask = np.ones((n_samples,), dtype=np.bool)
         n_inbag = max(1, int(self.subsample * n_samples))
-        # perform boosting iterations
-        for i in range(self.n_estimators):
+
+        # create argsorted X for fast tree induction
+        X_argsorted = np.asfortranarray(
+            np.argsort(X.T, axis=1).astype(np.int32).T)
+
+        random_state = check_random_state(self.random_state)
+
+        # extend arrays
+        new_estimators = np.empty((n, self.loss_.K),
+                                  dtype=np.object)
+
+        new_train_score = np.zeros((n,), dtype=np.float64)
+        new_oob_score = np.zeros((n,), dtype=np.float64)
+
+        if self.estimators_ is not None:
+            self.estimators_ = np.concatenate((self.estimators_, new_estimators))
+        else:
+            self.estimators_ = new_estimators
+
+        if self.train_score_ is not None:
+            self.train_score_ = np.concatenate((self.train_score_, new_train_score))
+        else:
+            self.train_score_ = new_train_score
+
+        if self.oob_score_ is not None:
+            self.oob_score_ = np.concatenate((self.oob_score_, new_oob_score))
+        else:
+            self.oob_score_ = new_oob_score
+
+        for i in xrange(self.stages_fit_, self.stages_fit_ + n):
 
             # subsampling
             if self.subsample < 1.0:
@@ -590,30 +630,32 @@ class BaseGradientBoosting(BaseEnsemble):
                 sample_mask = _random_sample_mask(n_samples, n_inbag,
                                                   random_state)
             # fit next stage of trees
-            y_pred = self._fit_stage(i, X, X_argsorted, y, y_pred, sample_mask,
+            self.y_pred_ = self._fit_stage(i, X, X_argsorted, y, self.y_pred_, sample_mask,
                                      random_state)
 
             # track deviance (= loss)
             if self.subsample < 1.0:
                 self.train_score_[i] = self.loss_(y[sample_mask],
-                                                  y_pred[sample_mask])
+                                                  self.y_pred_[sample_mask])
                 self.oob_score_[i] = self.loss_(y[~sample_mask],
-                                                y_pred[~sample_mask])
+                                                self.y_pred_[~sample_mask])
                 if self.verbose > 1:
                     print("built tree %d of %d, train score = %.6e, "
-                          "oob score = %.6e" % (i + 1, self.n_estimators,
+                          "oob score = %.6e" % (i + 1, self.stages_fit_ + n,
                                                 self.train_score_[i],
                                                 self.oob_score_[i]))
 
             else:
                 # no need to fancy index w/ no subsampling
-                self.train_score_[i] = self.loss_(y, y_pred)
+                self.train_score_[i] = self.loss_(y, self.y_pred_)
                 if self.verbose > 1:
                     print("built tree %d of %d, train score = %.6e" %
-                          (i + 1, self.n_estimators, self.train_score_[i]))
+                          (i + 1, self.stages_fit_ + n, self.train_score_[i]))
             if self.verbose == 1:
                 print(end='.')
                 sys.stdout.flush()
+
+        self.stages_fit_ += n
 
         return self
 
